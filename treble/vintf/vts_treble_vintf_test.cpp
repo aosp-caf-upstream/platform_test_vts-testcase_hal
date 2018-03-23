@@ -15,10 +15,12 @@
  */
 
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -31,6 +33,7 @@
 #include <gtest/gtest.h>
 #include <hidl-hash/Hash.h>
 #include <hidl-util/FQName.h>
+#include <hidl/HidlTransportUtils.h>
 #include <hidl/ServiceManagement.h>
 #include <procpartition/procpartition.h>
 #include <vintf/HalManifest.h>
@@ -163,10 +166,6 @@ class VtsTrebleVintfTest : public ::testing::Test {
     ASSERT_NE(default_manager_, nullptr)
         << "Failed to get default service manager." << endl;
 
-    passthrough_manager_ = ::android::hardware::getPassthroughServiceManager();
-    ASSERT_NE(passthrough_manager_, nullptr)
-        << "Failed to get passthrough service manager." << endl;
-
     vendor_manifest_ = VintfObject::GetDeviceHalManifest();
     ASSERT_NE(vendor_manifest_, nullptr)
         << "Failed to get vendor HAL manifest." << endl;
@@ -186,8 +185,6 @@ class VtsTrebleVintfTest : public ::testing::Test {
 
   // Default service manager.
   sp<IServiceManager> default_manager_;
-  // Passthrough service manager.
-  sp<IServiceManager> passthrough_manager_;
   // Vendor hal manifest.
   HalManifestPtr vendor_manifest_;
   // Framework hal manifest.
@@ -196,56 +193,58 @@ class VtsTrebleVintfTest : public ::testing::Test {
 
 void VtsTrebleVintfTest::ForEachHalInstance(const HalManifestPtr &manifest,
                                             HalVerifyFn fn) {
-  auto hal_names = manifest->getHalNames();
-  for (const string &hal_name : hal_names) {
-    for (const ManifestHal *hal : manifest->getHals(hal_name)) {
-      for (const Version &version : hal->versions) {
-        for (const auto &it : hal->interfaces) {
-          string iface_name = it.first;
-          set<string> instances = it.second.instances;
-          for (const string &instance_name : instances) {
-            string major_ver = std::to_string(version.majorVer);
-            string minor_ver = std::to_string(version.minorVer);
-            string full_ver = major_ver + "." + minor_ver;
-            FQName fq_name{hal_name, full_ver, iface_name};
-            Transport transport = hal->transport();
+  manifest->forEachInstance([manifest, fn](const auto &manifest_instance) {
+    const FQName fq_name{manifest_instance.package(),
+                         to_string(manifest_instance.version()),
+                         manifest_instance.interface()};
+    const Transport transport = manifest_instance.transport();
+    const std::string instance_name = manifest_instance.instance();
 
-            auto future_result =
-                std::async([&]() { fn(fq_name, instance_name, transport); });
-            auto timeout = std::chrono::milliseconds(500);
-            std::future_status status = future_result.wait_for(timeout);
-            if (status != std::future_status::ready) {
-              cout << "Timed out on: " << fq_name.string() << " "
-                   << instance_name << endl;
-            }
-          }
-        }
-      }
+    auto future_result =
+        std::async([&]() { fn(fq_name, instance_name, transport); });
+    auto timeout = std::chrono::seconds(1);
+    std::future_status status = future_result.wait_for(timeout);
+    if (status != std::future_status::ready) {
+      cout << "Timed out on: " << fq_name.string() << " " << instance_name
+           << endl;
     }
-  }
+    return true;  // continue to next instance
+  });
 }
 
 sp<IBase> VtsTrebleVintfTest::GetHalService(const FQName &fq_name,
                                             const string &instance_name,
                                             Transport transport, bool log) {
-  string hal_name = fq_name.package();
-  Version version{fq_name.getPackageMajorVersion(),
-                  fq_name.getPackageMinorVersion()};
-  string iface_name = fq_name.name();
-  string fq_iface_name = fq_name.string();
+  using android::hardware::details::getRawServiceInternal;
 
   if (log) {
-    cout << "Getting service of: " << fq_iface_name << " " << instance_name
-         << endl;
+    cout << "Getting: " << fq_name.string() << "/" << instance_name << endl;
   }
 
-  android::sp<IBase> hal_service = nullptr;
-  if (transport == Transport::HWBINDER) {
-    hal_service = default_manager_->get(fq_iface_name, instance_name);
-  } else if (transport == Transport::PASSTHROUGH) {
-    hal_service = passthrough_manager_->get(fq_iface_name, instance_name);
-  }
-  return hal_service;
+  // getService blocks until a service is available. In 100% of other cases
+  // where getService is used, it should be called directly. However, this test
+  // enforces that various services are actually available when they are
+  // declared, it must make a couple of precautions in case the service isn't
+  // actually available so that the proper failure can be reported.
+
+  auto task = std::packaged_task<sp<IBase>()>([fq_name, instance_name]() {
+    return getRawServiceInternal(fq_name.string(), instance_name,
+                                 true /* retry */, false /* getStub */);
+  });
+
+  std::future<sp<IBase>> future = task.get_future();
+  std::thread(std::move(task)).detach();
+  auto status = future.wait_for(std::chrono::milliseconds(500));
+
+  if (status != std::future_status::ready) return nullptr;
+
+  sp<IBase> base = future.get();
+  if (base == nullptr) return nullptr;
+
+  bool wantRemote = transport == Transport::HWBINDER;
+  if (base->isRemote() != wantRemote) return nullptr;
+
+  return base;
 }
 
 vector<string> VtsTrebleVintfTest::GetInterfaceChain(const sp<IBase> &service) {
@@ -260,17 +259,20 @@ vector<string> VtsTrebleVintfTest::GetInterfaceChain(const sp<IBase> &service) {
 
 // Tests that all HAL entries in VINTF has all required fields filled out.
 TEST_F(VtsTrebleVintfTest, HalEntriesAreComplete) {
-  auto hal_names = vendor_manifest_->getHalNames();
-  for (const string &hal_name : hal_names) {
+  for (const auto &hal_name : vendor_manifest_->getHalNames()) {
     for (const ManifestHal *hal : vendor_manifest_->getHals(hal_name)) {
-      EXPECT_FALSE(hal->versions.empty())
-          << hal_name << " has no version specified in VINTF.";
-      EXPECT_FALSE(hal->interfaces.empty())
-          << hal_name << " has no interface specified in VINTF.";
-      for (const auto &it : hal->interfaces) {
-        EXPECT_FALSE(it.second.instances.empty())
-            << hal_name << " has no instance specified in VINTF.";
-      }
+      // Do not suggest <fqname> for target FCM version < P.
+      bool allow_fqname = vendor_manifest_->level() != Level::UNSPECIFIED &&
+                          vendor_manifest_->level() >= 3 /* P */;
+
+      EXPECT_TRUE(hal->isOverride() || !hal->isDisabledHal())
+          << hal->getName()
+          << " has no instances declared and does not have override=\"true\". "
+          << "Do one of the following to fix: \n"
+          << (allow_fqname ? "  * Add <fqname> tags.\n" : "")
+          << "  * Add <version>, <interface> and <instance> tags.\n"
+          << "  * If the component should be disabled, add attribute "
+          << "override=\"true\".";
     }
   }
 }
@@ -311,11 +313,52 @@ TEST_F(VtsTrebleVintfTest, HalsAreServed) {
     return [this, expected_partition](const FQName &fq_name,
                                       const string &instance_name,
                                       Transport transport) {
-      sp<IBase> hal_service = GetHalService(fq_name, instance_name, transport);
+      sp<IBase> hal_service;
+
+      if (transport == Transport::PASSTHROUGH) {
+        using android::hardware::details::canCastInterface;
+
+        // Passthrough services all start with minor version 0.
+        // there are only three of them listed above. They are looked
+        // up based on their binary location. For instance,
+        // V1_0::IFoo::getService() might correspond to looking up
+        // android.hardware.foo@1.0-impl for the symbol
+        // HIDL_FETCH_IFoo. For @1.1::IFoo to continue to work with
+        // 1.0 clients, it must also be present in a library that is
+        // called the 1.0 name. Clients can say:
+        //     mFoo1_0 = V1_0::IFoo::getService();
+        //     mFoo1_1 = V1_1::IFoo::castFrom(mFoo1_0);
+        // This is the standard pattern for making a service work
+        // for both versions (mFoo1_1 != nullptr => you have 1.1)
+        // and a 1.0 client still works with the 1.1 interface.
+
+        if (!IsGoogleDefinedIface(fq_name)) {
+          // This isn't the case for extensions of core Google interfaces.
+          return;
+        }
+
+        const FQName lowest_name =
+            fq_name.withVersion(fq_name.getPackageMajorVersion(), 0);
+        hal_service = GetHalService(lowest_name, instance_name, transport);
+        EXPECT_TRUE(
+            canCastInterface(hal_service.get(), fq_name.string().c_str()));
+      } else {
+        hal_service = GetHalService(fq_name, instance_name, transport);
+      }
+
       EXPECT_NE(hal_service, nullptr)
           << fq_name.string() << " not available." << endl;
 
-      if (hal_service == nullptr || !hal_service->isRemote()) return;
+      if (hal_service == nullptr) return;
+
+      EXPECT_EQ(transport == Transport::HWBINDER, hal_service->isRemote())
+          << "transport is " << transport << "but HAL service is "
+          << (hal_service->isRemote() ? "" : "not") << " remote.";
+      EXPECT_EQ(transport == Transport::PASSTHROUGH, !hal_service->isRemote())
+          << "transport is " << transport << "but HAL service is "
+          << (hal_service->isRemote() ? "" : "not") << " remote.";
+
+      if (!hal_service->isRemote()) return;
 
       auto ret = hal_service->getDebugInfo([&](const auto &info) {
         Partition partition = PartitionOfProcess(info.pid);
@@ -333,29 +376,33 @@ TEST_F(VtsTrebleVintfTest, HalsAreServed) {
 }
 
 // Tests that all HALs which are served are specified in the VINTF
-// This tests (binderized HAL is served) => (binderized HAL in manifest)
+// This tests (HAL is served) => (HAL in manifest)
 TEST_F(VtsTrebleVintfTest, ServedHalsAreInManifest) {
   std::set<std::string> manifest_hwbinder_hals_;
+  std::set<std::string> manifest_passthrough_hals_;
 
-  auto add_manifest_hwbinder_hals = [&manifest_hwbinder_hals_](
-                                        const FQName &fq_name,
-                                        const string &instance_name,
-                                        Transport transport) {
-    if (transport != Transport::HWBINDER) return;
-
-    // 1.n in manifest => 1.0, 1.1, ... 1.n are all served
-    FQName fq = fq_name;
-    while (true) {
-      manifest_hwbinder_hals_.insert(fq.string() + "/" + instance_name);
-      if (fq.getPackageMinorVersion() <= 0) {
-        break;
+  auto add_manifest_hals = [&manifest_hwbinder_hals_,
+                            &manifest_passthrough_hals_](
+                               const FQName &fq_name,
+                               const string &instance_name,
+                               Transport transport) {
+    if (transport == Transport::HWBINDER) {
+      // 1.n in manifest => 1.0, 1.1, ... 1.n are all served (if they exist)
+      FQName fq = fq_name;
+      while (true) {
+        manifest_hwbinder_hals_.insert(fq.string() + "/" + instance_name);
+        if (fq.getPackageMinorVersion() <= 0) break;
+        fq = fq.downRev();
       }
-      fq = fq.downRev();
+    } else if (transport == Transport::PASSTHROUGH) {
+      manifest_passthrough_hals_.insert(fq_name.string() + "/" + instance_name);
+    } else {
+      ADD_FAILURE() << "Unrecognized transport: " << transport;
     }
   };
 
-  ForEachHalInstance(vendor_manifest_, add_manifest_hwbinder_hals);
-  ForEachHalInstance(fwk_manifest_, add_manifest_hwbinder_hals);
+  ForEachHalInstance(vendor_manifest_, add_manifest_hals);
+  ForEachHalInstance(fwk_manifest_, add_manifest_hals);
 
   Return<void> ret = default_manager_->list([&](const auto &list) {
     for (const auto &name : list) {
@@ -368,6 +415,45 @@ TEST_F(VtsTrebleVintfTest, ServedHalsAreInManifest) {
     }
   });
   EXPECT_TRUE(ret.isOk());
+
+  auto passthrough_interfaces_declared = [this, &manifest_passthrough_hals_](
+                                             const FQName &fq_name,
+                                             const string &instance_name,
+                                             Transport transport) {
+    if (transport != Transport::PASSTHROUGH) return;
+
+    // See HalsAreServed. These are always retrieved through the base interface
+    // and if it is not a google defined interface, it must be an extension of
+    // one.
+    if (!IsGoogleDefinedIface(fq_name)) return;
+
+    const FQName lowest_name =
+        fq_name.withVersion(fq_name.getPackageMajorVersion(), 0);
+    sp<IBase> hal_service =
+        GetHalService(lowest_name, instance_name, transport);
+    if (hal_service == nullptr) {
+      ADD_FAILURE() << "Could not get service " << fq_name.string() << "/"
+                    << instance_name;
+      return;
+    }
+
+    Return<void> ret = hal_service->interfaceChain(
+        [&manifest_passthrough_hals_, &instance_name](const auto &interfaces) {
+          for (const auto &interface : interfaces) {
+            if (std::string(interface) == IBase::descriptor) continue;
+
+            const std::string instance =
+                std::string(interface) + "/" + instance_name;
+            EXPECT_NE(manifest_passthrough_hals_.find(instance),
+                      manifest_passthrough_hals_.end())
+                << "Instance missing from manifest: " << instance;
+          }
+        });
+    EXPECT_TRUE(ret.isOk());
+  };
+
+  ForEachHalInstance(vendor_manifest_, passthrough_interfaces_declared);
+  ForEachHalInstance(fwk_manifest_, passthrough_interfaces_declared);
 }
 
 // Tests that HAL interfaces are officially released.
@@ -480,7 +566,7 @@ TEST_F(DeprecateTest, ShippingFcmVersion) {
 
 // Tests that deprecated HALs are not served, unless a higher, non-deprecated
 // minor version is served.
-TEST_F(DeprecateTest, NoDeprcatedHalsOnManager) {
+TEST_F(DeprecateTest, NoDeprecatedHalsOnManager) {
   // Predicate for whether an instance is served through service manager.
   // Return {is instance in service manager, highest minor version}
   // where "highest minor version" is the first element in getInterfaceChain()
@@ -532,10 +618,11 @@ TEST_F(DeprecateTest, NoDeprcatedHalsOnManager) {
 
 // Tests that deprecated HALs are not in the manifest, unless a higher,
 // non-deprecated minor version is in the manifest.
-TEST_F(DeprecateTest, NoDeprcatedHalsOnManifest) {
+TEST_F(DeprecateTest, NoDeprecatedHalsOnManifest) {
   string error;
   EXPECT_EQ(android::vintf::NO_DEPRECATED_HALS,
-            VintfObject::CheckDeprecation(&error));
+            VintfObject::CheckDeprecation(&error))
+      << error;
 }
 
 int main(int argc, char **argv) {
